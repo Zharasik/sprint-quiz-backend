@@ -4,6 +4,8 @@ import re
 import time
 import asyncio
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.responses import HTMLResponse
+from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from typing import Dict, Set
 import pathlib
@@ -18,7 +20,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-DATA_PATH = pathlib.Path(__file__).parent / "raw_questions.txt"
+DATA_PATH = pathlib.Path(__file__).parent / "midterm.txt"
 
 def parse_questions():
     """Парсит текстовый файл в список вопросов."""
@@ -58,7 +60,6 @@ def parse_questions():
 
 QUESTIONS = parse_questions()
 
-# Хранилище игроков и активных сессий
 players: Dict[str, dict] = {}
 active_connections: Set[WebSocket] = set()
 
@@ -68,7 +69,7 @@ async def broadcast_leaderboard():
         players.items(),
         key=lambda x: x[1]["score"],
         reverse=True
-    )[:10]  # Топ-10
+    )[:10]
     
     leaderboard_data = {
         "type": "leaderboard",
@@ -84,13 +85,372 @@ async def broadcast_leaderboard():
         except:
             pass
 
-@app.get("/")
-async def root():
-    return {
-        "status": "Sprint Quiz Backend Running",
-        "questions_loaded": len(QUESTIONS),
-        "active_players": len(players)
-    }
+# HTML Frontend встроенный
+HTML_CONTENT = """
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Sprint Quiz - Соревновательная подготовка</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+</head>
+<body>
+    <div id="root"></div>
+    
+    <script type="text/babel">
+        const { useState, useEffect, useRef } = React;
+        
+        // Lucide icons (простые SVG)
+        const Trophy = () => (
+            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                <path d="M6 9H4.5a2.5 2.5 0 0 1 0-5H6"></path>
+                <path d="M18 9h1.5a2.5 2.5 0 0 0 0-5H18"></path>
+                <path d="M4 22h16"></path>
+                <path d="M10 14.66V17c0 .55-.47.98-.97 1.21C7.85 18.75 7 20.24 7 22"></path>
+                <path d="M14 14.66V17c0 .55.47.98.97 1.21C16.15 18.75 17 20.24 17 22"></path>
+                <path d="M18 2H6v7a6 6 0 0 0 12 0V2Z"></path>
+            </svg>
+        );
+        
+        const Clock = () => (
+            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                <circle cx="12" cy="12" r="10"></circle>
+                <polyline points="12 6 12 12 16 14"></polyline>
+            </svg>
+        );
+        
+        const Users = () => (
+            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                <path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"></path>
+                <circle cx="9" cy="7" r="4"></circle>
+                <path d="M22 21v-2a4 4 0 0 0-3-3.87"></path>
+                <path d="M16 3.13a4 4 0 0 1 0 7.75"></path>
+            </svg>
+        );
+        
+        const Play = () => (
+            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                <polygon points="5 3 19 12 5 21 5 3"></polygon>
+            </svg>
+        );
+        
+        const Home = () => (
+            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                <path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"></path>
+                <polyline points="9 22 9 12 15 12 15 22"></polyline>
+            </svg>
+        );
+        
+        function SprintQuiz() {
+            const [ws, setWs] = useState(null);
+            const [screen, setScreen] = useState('home');
+            const [playerName, setPlayerName] = useState('');
+            const [currentQuestion, setCurrentQuestion] = useState(null);
+            const [score, setScore] = useState(0);
+            const [timeLeft, setTimeLeft] = useState(60);
+            const [leaderboard, setLeaderboard] = useState([]);
+            const [feedback, setFeedback] = useState(null);
+            const [isRegistered, setIsRegistered] = useState(false);
+            const timerRef = useRef(null);
+            
+            const WS_URL = `ws${window.location.protocol === 'https:' ? 's' : ''}://${window.location.host}/ws`;
+            
+            useEffect(() => {
+                return () => {
+                    if (ws) ws.close();
+                    if (timerRef.current) clearInterval(timerRef.current);
+                };
+            }, [ws]);
+            
+            const connectWebSocket = () => {
+                const socket = new WebSocket(WS_URL);
+                
+                socket.onopen = () => {
+                    console.log('WebSocket подключен');
+                    setWs(socket);
+                };
+                
+                socket.onmessage = (event) => {
+                    const data = JSON.parse(event.data);
+                    
+                    if (data.status === 'registered') {
+                        setIsRegistered(true);
+                        setTimeout(() => {
+                            socket.send(JSON.stringify({ action: 'start_game' }));
+                            socket.send(JSON.stringify({ action: 'get_question' }));
+                            setScreen('game');
+                            setScore(0);
+                            setTimeLeft(60);
+                            startTimer();
+                        }, 300);
+                    }
+                    
+                    if (data.type === 'question') {
+                        setCurrentQuestion(data.q);
+                        setFeedback(null);
+                    }
+                    
+                    if (data.type === 'answer_result') {
+                        setScore(data.score);
+                        setFeedback(data.result);
+                        
+                        setTimeout(() => {
+                            setFeedback(null);
+                            socket.send(JSON.stringify({ action: 'get_question' }));
+                        }, 800);
+                    }
+                    
+                    if (data.type === 'leaderboard') {
+                        setLeaderboard(data.players);
+                    }
+                    
+                    if (data.type === 'game_over') {
+                        endGame(data.final_score);
+                    }
+                };
+                
+                socket.onerror = (error) => {
+                    console.error('WebSocket ошибка:', error);
+                };
+            };
+            
+            const startGame = () => {
+                if (!playerName.trim()) {
+                    alert('Введите ваше имя!');
+                    return;
+                }
+                
+                connectWebSocket();
+                setTimeout(() => {
+                    if (ws && ws.readyState === WebSocket.OPEN) {
+                        ws.send(JSON.stringify({
+                            action: 'register',
+                            name: playerName
+                        }));
+                    }
+                }, 500);
+            };
+            
+            const startTimer = () => {
+                timerRef.current = setInterval(() => {
+                    setTimeLeft((prev) => {
+                        if (prev <= 1) {
+                            endGame(score);
+                            return 0;
+                        }
+                        return prev - 1;
+                    });
+                }, 1000);
+            };
+            
+            const endGame = (finalScore) => {
+                if (timerRef.current) {
+                    clearInterval(timerRef.current);
+                }
+                setScore(finalScore);
+                setScreen('leaderboard');
+                if (ws) {
+                    ws.send(JSON.stringify({ action: 'get_leaderboard' }));
+                }
+            };
+            
+            const handleAnswer = (choice) => {
+                if (!currentQuestion || feedback) return;
+                
+                const answer = choice.charAt(0);
+                
+                if (ws && ws.readyState === WebSocket.OPEN) {
+                    ws.send(JSON.stringify({
+                        action: 'answer',
+                        answer: answer,
+                        correct: currentQuestion.answer
+                    }));
+                }
+            };
+            
+            const restartGame = () => {
+                setScreen('home');
+                setScore(0);
+                setTimeLeft(60);
+                setCurrentQuestion(null);
+                setFeedback(null);
+                setPlayerName('');
+                if (ws) ws.close();
+            };
+            
+            if (screen === 'home') {
+                return (
+                    <div className="min-h-screen bg-gradient-to-br from-blue-500 via-purple-500 to-pink-500 flex items-center justify-center p-4">
+                        <div className="bg-white rounded-3xl shadow-2xl p-8 max-w-md w-full">
+                            <div className="text-center mb-8">
+                                <div className="inline-flex bg-gradient-to-r from-yellow-400 to-orange-500 p-4 rounded-full mb-4">
+                                    <Trophy />
+                                </div>
+                                <h1 className="text-4xl font-bold text-gray-800 mb-2">Sprint Quiz</h1>
+                                <p className="text-gray-600">60 секунд. Максимум правильных ответов.</p>
+                            </div>
+                            
+                            <div className="space-y-4">
+                                <input
+                                    type="text"
+                                    placeholder="Введите ваше имя"
+                                    value={playerName}
+                                    onChange={(e) => setPlayerName(e.target.value)}
+                                    onKeyPress={(e) => e.key === 'Enter' && startGame()}
+                                    className="w-full px-4 py-3 border-2 border-gray-300 rounded-xl focus:border-blue-500 focus:outline-none text-lg"
+                                />
+                                
+                                <button
+                                    onClick={startGame}
+                                    disabled={!playerName.trim()}
+                                    className="w-full bg-gradient-to-r from-green-400 to-blue-500 text-white py-4 rounded-xl font-bold text-lg hover:shadow-lg transform hover:scale-105 transition-all disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2"
+                                >
+                                    <Play />
+                                    Начать игру
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                );
+            }
+            
+            if (screen === 'game') {
+                return (
+                    <div className="min-h-screen bg-gradient-to-br from-indigo-500 via-purple-500 to-pink-500 p-4">
+                        <div className="max-w-4xl mx-auto">
+                            <div className="bg-white rounded-2xl shadow-lg p-4 mb-4 flex justify-between items-center">
+                                <div className="flex items-center gap-4">
+                                    <div className="bg-blue-100 p-3 rounded-xl">
+                                        <Users />
+                                    </div>
+                                    <div>
+                                        <p className="text-sm text-gray-500">Игрок</p>
+                                        <p className="font-bold text-lg">{playerName}</p>
+                                    </div>
+                                </div>
+                                
+                                <div className="flex items-center gap-6">
+                                    <div className="text-center">
+                                        <p className="text-sm text-gray-500">Счёт</p>
+                                        <p className="text-2xl font-bold text-green-600">{score}</p>
+                                    </div>
+                                    
+                                    <div className="flex items-center gap-2 bg-red-100 px-4 py-2 rounded-xl">
+                                        <Clock />
+                                        <span className="text-2xl font-bold text-red-600">{timeLeft}s</span>
+                                    </div>
+                                </div>
+                            </div>
+                            
+                            {currentQuestion && (
+                                <div className="bg-white rounded-2xl shadow-2xl p-8">
+                                    <h2 className="text-2xl font-bold text-gray-800 mb-6">
+                                        {currentQuestion.question}
+                                    </h2>
+                                    
+                                    <div className="space-y-3">
+                                        {currentQuestion.choices.map((choice, idx) => {
+                                            const isCorrect = feedback === 'correct' && choice.charAt(0) === currentQuestion.answer;
+                                            const isWrong = feedback === 'wrong' && choice.charAt(0) !== currentQuestion.answer;
+                                            
+                                            return (
+                                                <button
+                                                    key={idx}
+                                                    onClick={() => handleAnswer(choice)}
+                                                    disabled={feedback !== null}
+                                                    className={`w-full text-left px-6 py-4 rounded-xl font-semibold text-lg transition-all ${
+                                                        isCorrect
+                                                            ? 'bg-green-500 text-white'
+                                                            : isWrong
+                                                            ? 'bg-red-500 text-white'
+                                                            : 'bg-gray-100 hover:bg-gray-200 text-gray-800'
+                                                    }`}
+                                                >
+                                                    {choice}
+                                                </button>
+                                            );
+                                        })}
+                                    </div>
+                                    
+                                    {feedback && (
+                                        <div className={`mt-6 p-4 rounded-xl text-center font-bold text-lg ${
+                                            feedback === 'correct' ? 'bg-green-100 text-green-700' : 'bg-red-100 text-red-700'
+                                        }`}>
+                                            {feedback === 'correct' ? '✅ Правильно!' : '❌ Неправильно'}
+                                        </div>
+                                    )}
+                                </div>
+                            )}
+                        </div>
+                    </div>
+                );
+            }
+            
+            if (screen === 'leaderboard') {
+                return (
+                    <div className="min-h-screen bg-gradient-to-br from-purple-500 via-pink-500 to-red-500 flex items-center justify-center p-4">
+                        <div className="bg-white rounded-3xl shadow-2xl p-8 max-w-2xl w-full">
+                            <div className="text-center mb-8">
+                                <div className="inline-flex bg-gradient-to-r from-yellow-400 to-orange-500 p-4 rounded-full mb-4">
+                                    <Trophy />
+                                </div>
+                                <h1 className="text-4xl font-bold text-gray-800 mb-2">Игра завершена!</h1>
+                                <p className="text-2xl text-gray-600">Ваш счёт: <span className="font-bold text-green-600">{score}</span></p>
+                            </div>
+                            
+                            <div className="mb-8">
+                                <h2 className="text-2xl font-bold text-gray-800 mb-4 flex items-center gap-2">
+                                    <Users />
+                                    Таблица лидеров
+                                </h2>
+                                <div className="space-y-2">
+                                    {leaderboard.map((player, idx) => (
+                                        <div
+                                            key={idx}
+                                            className={`flex items-center justify-between p-4 rounded-xl ${
+                                                idx === 0 ? 'bg-yellow-100 border-2 border-yellow-400' :
+                                                idx === 1 ? 'bg-gray-100 border-2 border-gray-400' :
+                                                idx === 2 ? 'bg-orange-100 border-2 border-orange-400' :
+                                                'bg-gray-50'
+                                            }`}
+                                        >
+                                            <div className="flex items-center gap-4">
+                                                <span className="text-2xl font-bold text-gray-600 w-8">#{idx + 1}</span>
+                                                <span className="font-semibold text-lg">{player.name}</span>
+                                            </div>
+                                            <span className="text-2xl font-bold text-green-600">{player.score}</span>
+                                        </div>
+                                    ))}
+                                </div>
+                            </div>
+                            
+                            <button
+                                onClick={restartGame}
+                                className="w-full bg-gradient-to-r from-blue-500 to-purple-600 text-white py-4 rounded-xl font-bold text-lg hover:shadow-lg transform hover:scale-105 transition-all flex items-center justify-center gap-2"
+                            >
+                                <Home />
+                                Играть ещё раз
+                            </button>
+                        </div>
+                    </div>
+                );
+            }
+        }
+        
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<SprintQuiz />);
+    </script>
+</body>
+</html>
+"""
+
+@app.get("/", response_class=HTMLResponse)
+async def get_index():
+    return HTML_CONTENT
 
 @app.get("/stats")
 async def stats():
@@ -114,7 +474,6 @@ async def websocket_endpoint(ws: WebSocket):
         while True:
             data = await ws.receive_json()
             
-            # Регистрация игрока
             if data["action"] == "register":
                 player_id = data["name"]
                 players[player_id] = {
@@ -129,7 +488,6 @@ async def websocket_endpoint(ws: WebSocket):
                 })
                 await broadcast_leaderboard()
             
-            # Старт игры (60 секунд)
             elif data["action"] == "start_game":
                 if player_id:
                     players[player_id]["start_time"] = time.time()
@@ -137,7 +495,6 @@ async def websocket_endpoint(ws: WebSocket):
                     players[player_id]["score"] = 0
                     await ws.send_json({"status": "game_started"})
             
-            # Запрос нового вопроса
             elif data["action"] == "get_question":
                 if not QUESTIONS:
                     await ws.send_json({"error": "No questions available"})
@@ -149,12 +506,10 @@ async def websocket_endpoint(ws: WebSocket):
                     "q": q
                 })
             
-            # Ответ на вопрос
             elif data["action"] == "answer":
                 if not player_id or player_id not in players:
                     continue
                 
-                # Проверка времени (60 секунд)
                 elapsed = time.time() - players[player_id]["start_time"]
                 if elapsed > 60:
                     players[player_id]["game_active"] = False
@@ -182,16 +537,13 @@ async def websocket_endpoint(ws: WebSocket):
                     "time_left": max(0, 60 - elapsed)
                 })
                 
-                # Обновляем рейтинг для всех
                 await broadcast_leaderboard()
             
-            # Запрос рейтинга
             elif data["action"] == "get_leaderboard":
                 await broadcast_leaderboard()
     
     except WebSocketDisconnect:
         active_connections.discard(ws)
-        # Не удаляем игрока, чтобы сохранить его в рейтинге
     
     except Exception as e:
         print(f"WebSocket error: {e}")
