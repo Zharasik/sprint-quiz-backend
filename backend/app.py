@@ -25,6 +25,7 @@ DATA_PATH = pathlib.Path(__file__).parent / "midterm.txt"
 def parse_questions():
     """Парсит текстовый файл в список вопросов."""
     if not DATA_PATH.exists():
+        print(f"ERROR: File {DATA_PATH} not found!")
         return []
     
     raw = DATA_PATH.read_text(encoding="utf-8")
@@ -56,6 +57,7 @@ def parse_questions():
                 "answer": answer_raw
             })
     
+    print(f"INFO: Loaded {len(questions)} questions from {DATA_PATH}")
     return questions
 
 QUESTIONS = parse_questions()
@@ -154,67 +156,101 @@ HTML_CONTENT = """
             const [timeLeft, setTimeLeft] = useState(60);
             const [leaderboard, setLeaderboard] = useState([]);
             const [feedback, setFeedback] = useState(null);
-            const [isRegistered, setIsRegistered] = useState(false);
+            const [connectionStatus, setConnectionStatus] = useState('disconnected');
             const timerRef = useRef(null);
+            const wsRef = useRef(null);
             
             const WS_URL = `ws${window.location.protocol === 'https:' ? 's' : ''}://${window.location.host}/ws`;
             
             useEffect(() => {
                 return () => {
-                    if (ws) ws.close();
-                    if (timerRef.current) clearInterval(timerRef.current);
+                    if (wsRef.current) {
+                        wsRef.current.close();
+                    }
+                    if (timerRef.current) {
+                        clearInterval(timerRef.current);
+                    }
                 };
-            }, [ws]);
+            }, []);
             
             const connectWebSocket = () => {
+                console.log('Connecting to:', WS_URL);
                 const socket = new WebSocket(WS_URL);
+                wsRef.current = socket;
                 
                 socket.onopen = () => {
-                    console.log('WebSocket подключен');
+                    console.log('✅ WebSocket подключен');
+                    setConnectionStatus('connected');
                     setWs(socket);
+                    
+                    // Сразу регистрируем игрока
+                    console.log('Registering player:', playerName);
+                    socket.send(JSON.stringify({
+                        action: 'register',
+                        name: playerName
+                    }));
                 };
                 
                 socket.onmessage = (event) => {
                     const data = JSON.parse(event.data);
+                    console.log('Received:', data);
                     
                     if (data.status === 'registered') {
-                        setIsRegistered(true);
+                        console.log('✅ Player registered, starting game...');
+                        setConnectionStatus('registered');
+                        
+                        // Начинаем игру
+                        socket.send(JSON.stringify({ action: 'start_game' }));
+                        
+                        // Запрашиваем первый вопрос
                         setTimeout(() => {
-                            socket.send(JSON.stringify({ action: 'start_game' }));
+                            console.log('Requesting first question...');
                             socket.send(JSON.stringify({ action: 'get_question' }));
-                            setScreen('game');
-                            setScore(0);
-                            setTimeLeft(60);
-                            startTimer();
-                        }, 300);
+                        }, 200);
+                        
+                        setScreen('game');
+                        setScore(0);
+                        setTimeLeft(60);
+                        startTimer();
                     }
                     
                     if (data.type === 'question') {
+                        console.log('✅ Question received:', data.q.question);
                         setCurrentQuestion(data.q);
                         setFeedback(null);
                     }
                     
                     if (data.type === 'answer_result') {
+                        console.log('Answer result:', data.result);
                         setScore(data.score);
                         setFeedback(data.result);
                         
                         setTimeout(() => {
                             setFeedback(null);
+                            console.log('Requesting next question...');
                             socket.send(JSON.stringify({ action: 'get_question' }));
                         }, 800);
                     }
                     
                     if (data.type === 'leaderboard') {
+                        console.log('Leaderboard updated:', data.players);
                         setLeaderboard(data.players);
                     }
                     
                     if (data.type === 'game_over') {
+                        console.log('Game over!');
                         endGame(data.final_score);
                     }
                 };
                 
                 socket.onerror = (error) => {
-                    console.error('WebSocket ошибка:', error);
+                    console.error('❌ WebSocket ошибка:', error);
+                    setConnectionStatus('error');
+                };
+                
+                socket.onclose = () => {
+                    console.log('WebSocket отключен');
+                    setConnectionStatus('disconnected');
                 };
             };
             
@@ -224,18 +260,16 @@ HTML_CONTENT = """
                     return;
                 }
                 
+                console.log('Starting game for:', playerName);
+                setConnectionStatus('connecting');
                 connectWebSocket();
-                setTimeout(() => {
-                    if (ws && ws.readyState === WebSocket.OPEN) {
-                        ws.send(JSON.stringify({
-                            action: 'register',
-                            name: playerName
-                        }));
-                    }
-                }, 500);
             };
             
             const startTimer = () => {
+                if (timerRef.current) {
+                    clearInterval(timerRef.current);
+                }
+                
                 timerRef.current = setInterval(() => {
                     setTimeLeft((prev) => {
                         if (prev <= 1) {
@@ -248,13 +282,14 @@ HTML_CONTENT = """
             };
             
             const endGame = (finalScore) => {
+                console.log('Ending game with score:', finalScore);
                 if (timerRef.current) {
                     clearInterval(timerRef.current);
                 }
                 setScore(finalScore);
                 setScreen('leaderboard');
-                if (ws) {
-                    ws.send(JSON.stringify({ action: 'get_leaderboard' }));
+                if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+                    wsRef.current.send(JSON.stringify({ action: 'get_leaderboard' }));
                 }
             };
             
@@ -262,9 +297,10 @@ HTML_CONTENT = """
                 if (!currentQuestion || feedback) return;
                 
                 const answer = choice.charAt(0);
+                console.log('Answering:', answer, 'Correct:', currentQuestion.answer);
                 
-                if (ws && ws.readyState === WebSocket.OPEN) {
-                    ws.send(JSON.stringify({
+                if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+                    wsRef.current.send(JSON.stringify({
                         action: 'answer',
                         answer: answer,
                         correct: currentQuestion.answer
@@ -279,7 +315,10 @@ HTML_CONTENT = """
                 setCurrentQuestion(null);
                 setFeedback(null);
                 setPlayerName('');
-                if (ws) ws.close();
+                setConnectionStatus('disconnected');
+                if (wsRef.current) {
+                    wsRef.current.close();
+                }
             };
             
             if (screen === 'home') {
@@ -292,6 +331,14 @@ HTML_CONTENT = """
                                 </div>
                                 <h1 className="text-4xl font-bold text-gray-800 mb-2">Sprint Quiz</h1>
                                 <p className="text-gray-600">60 секунд. Максимум правильных ответов.</p>
+                                {connectionStatus !== 'disconnected' && (
+                                    <p className="text-sm text-blue-600 mt-2">
+                                        {connectionStatus === 'connecting' && '🔄 Подключение...'}
+                                        {connectionStatus === 'connected' && '✅ Подключено!'}
+                                        {connectionStatus === 'registered' && '✅ Игра началась!'}
+                                        {connectionStatus === 'error' && '❌ Ошибка подключения'}
+                                    </p>
+                                )}
                             </div>
                             
                             <div className="space-y-4">
@@ -302,15 +349,16 @@ HTML_CONTENT = """
                                     onChange={(e) => setPlayerName(e.target.value)}
                                     onKeyPress={(e) => e.key === 'Enter' && startGame()}
                                     className="w-full px-4 py-3 border-2 border-gray-300 rounded-xl focus:border-blue-500 focus:outline-none text-lg"
+                                    disabled={connectionStatus === 'connecting'}
                                 />
                                 
                                 <button
                                     onClick={startGame}
-                                    disabled={!playerName.trim()}
+                                    disabled={!playerName.trim() || connectionStatus === 'connecting'}
                                     className="w-full bg-gradient-to-r from-green-400 to-blue-500 text-white py-4 rounded-xl font-bold text-lg hover:shadow-lg transform hover:scale-105 transition-all disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2"
                                 >
                                     <Play />
-                                    Начать игру
+                                    {connectionStatus === 'connecting' ? 'Подключение...' : 'Начать игру'}
                                 </button>
                             </div>
                         </div>
@@ -346,7 +394,13 @@ HTML_CONTENT = """
                                 </div>
                             </div>
                             
-                            {currentQuestion && (
+                            {!currentQuestion ? (
+                                <div className="bg-white rounded-2xl shadow-2xl p-8 text-center">
+                                    <div className="animate-pulse">
+                                        <p className="text-xl text-gray-600">Загрузка вопроса...</p>
+                                    </div>
+                                </div>
+                            ) : (
                                 <div className="bg-white rounded-2xl shadow-2xl p-8">
                                     <h2 className="text-2xl font-bold text-gray-800 mb-6">
                                         {currentQuestion.question}
@@ -407,25 +461,31 @@ HTML_CONTENT = """
                                     <Users />
                                     Таблица лидеров
                                 </h2>
-                                <div className="space-y-2">
-                                    {leaderboard.map((player, idx) => (
-                                        <div
-                                            key={idx}
-                                            className={`flex items-center justify-between p-4 rounded-xl ${
-                                                idx === 0 ? 'bg-yellow-100 border-2 border-yellow-400' :
-                                                idx === 1 ? 'bg-gray-100 border-2 border-gray-400' :
-                                                idx === 2 ? 'bg-orange-100 border-2 border-orange-400' :
-                                                'bg-gray-50'
-                                            }`}
-                                        >
-                                            <div className="flex items-center gap-4">
-                                                <span className="text-2xl font-bold text-gray-600 w-8">#{idx + 1}</span>
-                                                <span className="font-semibold text-lg">{player.name}</span>
+                                {leaderboard.length === 0 ? (
+                                    <div className="text-center p-8 bg-gray-50 rounded-xl">
+                                        <p className="text-gray-500">Пока нет игроков в рейтинге</p>
+                                    </div>
+                                ) : (
+                                    <div className="space-y-2">
+                                        {leaderboard.map((player, idx) => (
+                                            <div
+                                                key={idx}
+                                                className={`flex items-center justify-between p-4 rounded-xl ${
+                                                    idx === 0 ? 'bg-yellow-100 border-2 border-yellow-400' :
+                                                    idx === 1 ? 'bg-gray-100 border-2 border-gray-400' :
+                                                    idx === 2 ? 'bg-orange-100 border-2 border-orange-400' :
+                                                    'bg-gray-50'
+                                                }`}
+                                            >
+                                                <div className="flex items-center gap-4">
+                                                    <span className="text-2xl font-bold text-gray-600 w-8">#{idx + 1}</span>
+                                                    <span className="font-semibold text-lg">{player.name}</span>
+                                                </div>
+                                                <span className="text-2xl font-bold text-green-600">{player.score}</span>
                                             </div>
-                                            <span className="text-2xl font-bold text-green-600">{player.score}</span>
-                                        </div>
-                                    ))}
-                                </div>
+                                        ))}
+                                    </div>
+                                )}
                             </div>
                             
                             <button
@@ -470,9 +530,12 @@ async def websocket_endpoint(ws: WebSocket):
     active_connections.add(ws)
     player_id = None
     
+    print(f"New WebSocket connection. Total connections: {len(active_connections)}")
+    
     try:
         while True:
             data = await ws.receive_json()
+            print(f"Received action: {data.get('action')} from {player_id}")
             
             if data["action"] == "register":
                 player_id = data["name"]
@@ -481,6 +544,7 @@ async def websocket_endpoint(ws: WebSocket):
                     "start_time": time.time(),
                     "game_active": True
                 }
+                print(f"Player registered: {player_id}")
                 await ws.send_json({
                     "status": "registered",
                     "name": player_id,
@@ -493,14 +557,17 @@ async def websocket_endpoint(ws: WebSocket):
                     players[player_id]["start_time"] = time.time()
                     players[player_id]["game_active"] = True
                     players[player_id]["score"] = 0
+                    print(f"Game started for: {player_id}")
                     await ws.send_json({"status": "game_started"})
             
             elif data["action"] == "get_question":
                 if not QUESTIONS:
+                    print("ERROR: No questions available!")
                     await ws.send_json({"error": "No questions available"})
                     continue
                 
                 q = random.choice(QUESTIONS)
+                print(f"Sending question to {player_id}: {q['question'][:50]}...")
                 await ws.send_json({
                     "type": "question",
                     "q": q
@@ -513,6 +580,7 @@ async def websocket_endpoint(ws: WebSocket):
                 elapsed = time.time() - players[player_id]["start_time"]
                 if elapsed > 60:
                     players[player_id]["game_active"] = False
+                    print(f"Game over for {player_id} - time expired")
                     await ws.send_json({
                         "type": "game_over",
                         "final_score": players[player_id]["score"],
@@ -530,6 +598,8 @@ async def websocket_endpoint(ws: WebSocket):
                 else:
                     result = "wrong"
                 
+                print(f"{player_id} answered {result}. Score: {players[player_id]['score']}")
+                
                 await ws.send_json({
                     "type": "answer_result",
                     "result": result,
@@ -544,6 +614,7 @@ async def websocket_endpoint(ws: WebSocket):
     
     except WebSocketDisconnect:
         active_connections.discard(ws)
+        print(f"WebSocket disconnected. Player: {player_id}. Remaining connections: {len(active_connections)}")
     
     except Exception as e:
         print(f"WebSocket error: {e}")
@@ -551,4 +622,5 @@ async def websocket_endpoint(ws: WebSocket):
 
 if __name__ == "__main__":
     import uvicorn
+    print(f"Starting server with {len(QUESTIONS)} questions loaded")
     uvicorn.run(app, host="0.0.0.0", port=8000)
